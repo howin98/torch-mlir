@@ -601,7 +601,7 @@ ChangeResult TypeAnalyzer::visitOperation(
           AtenIndexTensorOp, ValsemVariantAtenIndexPutImplOp, AtenIndexPutOp,
           ValsemVariantAtenCopyOp, ValsemVariantAtenZeroOp,
           AtenIndexPutHackedTwinOp, AtenMaskedFillScalarOp, AtenFlipOp,
-          PrimAbsScalarOp>(op)) {
+          PrimAbsScalarOp, AtenLinalgVectorNormOp>(op)) {
     return incorporateKnowledge(op->getResult(0), operands[0]->getValue());
   }
 

@@ -3071,6 +3071,33 @@ module {
     %none = torch.constant.none
     return %none : !torch.none
   }
+  func @"__torch_mlir_shape_fn.aten.linalg_vector_norm"(%arg0: !torch.list<int>, %arg1: !torch.float, %arg2: !torch.optional<list<int>>, %arg3: !torch.bool, %arg4: !torch.optional<int>) -> !torch.list<int> {
+    %int1 = torch.constant.int 1
+    %none = torch.constant.none
+    %true = torch.constant.bool true
+    %0 = torch.aten.__isnot__ %arg2, %none : !torch.optional<list<int>>, !torch.none -> !torch.bool
+    %1 = torch.prim.If %0 -> (!torch.list<int>) {
+      %2 = torch.prim.unchecked_cast %arg2 : !torch.optional<list<int>> -> !torch.list<int>
+      %3 = torch.derefine %arg4 : !torch.optional<int> to !torch.any
+      %4 = call @__torch__.torch_mlir.dialects.torch.importer.jit_ir.build_tools.upstream_shape_helpers.mean_dim(%arg0, %2, %arg3, %3) : (!torch.list<int>, !torch.list<int>, !torch.bool, !torch.any) -> !torch.list<int>
+      torch.prim.If.yield %4 : !torch.list<int>
+    } else {
+      %2 = torch.prim.ListConstruct  : () -> !torch.list<int>
+      torch.prim.If %arg3 -> () {
+        %3 = torch.aten.len.t %arg0 : !torch.list<int> -> !torch.int
+        torch.prim.Loop %3, %true, init() {
+        ^bb0(%arg5: !torch.int):
+          %4 = torch.aten.append.t %2, %int1 : !torch.list<int>, !torch.int -> !torch.list<int>
+          torch.prim.Loop.condition %true, iter()
+        } : (!torch.int, !torch.bool) -> ()
+        torch.prim.If.yield
+      } else {
+        torch.prim.If.yield
+      }
+      torch.prim.If.yield %2 : !torch.list<int>
+    }
+    return %1 : !torch.list<int>
+  }
 }
 )mlir");
 #pragma clang diagnostic pop
