@@ -15,6 +15,7 @@
 #include "mlir/Dialect/Arithmetic/IR/Arithmetic.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Matchers.h"
 #include "torch-mlir/Conversion/Utils/Utils.h"
@@ -262,16 +263,18 @@ private:
       return rewriter.notifyMatchFailure(op, "keepdim not present");
 
     SmallVector<int64_t> dimList;
-    if (!matchPattern(op.dim(), m_TorchConstantIntList(dimList)))
-      return rewriter.notifyMatchFailure(op, "dim not present");
-
-    for (auto dim : dimList) {
-      // Torch allows for negative values in dimSet to go in reverse
-      // order in the dimensions of the input tensor.
-      dim = dim >= 0 ? dim : dim + inputType.getRank();
-      // Drop invalid dimensions
-      if (dim < inputType.getRank())
-        opInfo.dimSet.insert(dim);
+    if (matchPattern(op.dim(), m_TorchConstantIntList(dimList))) {
+      // Fix negative dimensions, if any, before adding to the list.
+      for (auto dim : dimList) {
+        dim = dim >= 0 ? dim : dim + inputType.getRank();
+        // Drop invalid dimensions
+        if (dim < inputType.getRank())
+          opInfo.dimSet.insert(dim);
+      }
+    } else {
+      // Reduce along all dimensions
+      for (int64_t i = 0; i < inputType.getRank(); i++)
+        opInfo.dimSet.insert(i);
     }
 
     return success();
@@ -301,7 +304,71 @@ private:
     if (auto sumOp = dyn_cast<AtenSumDimIntListOp>(op))
       return computeReductionOpInfoFromDimOp(sumOp, operands, rewriter, opInfo);
 
+    if (auto normOp = dyn_cast<AtenLinalgVectorNormOp>(op))
+      return computeReductionOpInfoFromDimOp(normOp, operands, rewriter,
+                                             opInfo);
+
     return rewriter.notifyMatchFailure(op, "not a supported reduce op");
+  }
+
+  Value payloadForNormSummation(OpBuilder &b, Location loc,
+                                ValueRange payloadArgs, Value ord,
+                                Type elemType) const {
+    // TODO: Short-circuit operations if `ord` is zero or one.
+    auto elem = payloadArgs[0];
+    auto result = payloadArgs[1];
+    auto self = convertScalarToDtype(b, loc, elem, elemType);
+    auto abs = b.create<math::AbsOp>(loc, self);
+    auto pow = b.create<math::PowFOp>(loc, abs, ord);
+    return b.create<arith::AddFOp>(loc, pow, result);
+  }
+
+  /// Generate a linalg.generic operation for performing a sum reduction along
+  /// the tensor and dimensions specified in `opInfo`, such that the element
+  /// type of the result tensor is `elemType`.
+  Value createNormSumReduction(Location loc, Type elemType,
+                               const ReductionOpInfo &opInfo, Value ord,
+                               ConversionPatternRewriter &rewriter) const {
+    auto err = false;
+
+    // Function to create the body of the linalg.generic operation.
+    auto sumBodyBuilder = [&](OpBuilder &builder, Location loc,
+                              ValueRange payloadArgs) {
+      auto result =
+          payloadForNormSummation(builder, loc, payloadArgs, ord, elemType);
+      if (result)
+        builder.create<linalg::YieldOp>(loc, result);
+      err = !result;
+    };
+
+    auto zeroAttr = rewriter.getZeroAttr(elemType);
+    auto initElement = rewriter.create<arith::ConstantOp>(loc, zeroAttr);
+
+    // linalg.generic operation for sum reduction
+    auto sumOp = torch_to_linalg::createReductionLinalgGeneric(
+        rewriter, loc, opInfo.tensorOperand, opInfo.dimSet, opInfo.keepDim,
+        initElement, sumBodyBuilder);
+    return err || !sumOp ? Value{} : sumOp;
+  }
+
+  /// Generate a linalg.generic operation for pointwise exponentiation of each
+  /// element.
+  Value createNormExp(Location loc, Type elemType, Value exponent, Value sumOp,
+                      const ReductionOpInfo &opInfo,
+                      ConversionPatternRewriter &rewriter) const {
+    bool err = false;
+    auto powBodyBuilder = [&](OpBuilder &builder, Location loc,
+                              ValueRange payloadArgs) {
+      auto elem = convertScalarToDtype(builder, loc, payloadArgs[0], elemType);
+      auto result = builder.create<math::PowFOp>(loc, elem, exponent);
+      if (result)
+        builder.create<linalg::YieldOp>(loc, Value{result});
+      err = !result;
+    };
+
+    auto powOp = torch_to_linalg::createElementwiseLinalgGeneric(
+        rewriter, loc, {sumOp}, elemType, powBodyBuilder);
+    return err || !powOp ? Value{} : powOp;
   }
 
 public:
@@ -322,6 +389,46 @@ public:
     auto resultType = getTypeConverter()
                           ->convertType(op->getResult(0).getType())
                           .cast<RankedTensorType>();
+
+    if (auto normOp = dyn_cast<AtenLinalgVectorNormOp>(op)) {
+      auto elemType = resultType.getElementType();
+
+      if (!elemType.isa<mlir::FloatType>())
+        return rewriter.notifyMatchFailure(
+            op, "only float types are valid for vector norm ops");
+
+      // Cast `ord` to float so that we can readily pass it math.powf.
+      auto ordValue = operands[1];
+      if (ordValue.getType().isa<mlir::IntegerType>())
+        ordValue = rewriter.create<arith::SIToFPOp>(loc, elemType, ordValue);
+
+      // Sum each element of the tensor after computing the exponentiation.
+      auto sumOp =
+          createNormSumReduction(loc, elemType, opInfo, ordValue, rewriter);
+      if (!sumOp)
+        return failure();
+
+      // TODO: Add support for L0 norm.
+      auto epsilon = 1e-5;
+      auto ordLiteral = 0.0;
+      if (matchPattern(ordValue, m_TorchConstantFloat(&ordLiteral)) &&
+          fabs(ordLiteral) < epsilon)
+        return rewriter.notifyMatchFailure(op, "unimplemented: L0 norm");
+
+      // Raise each summed value to the inverse of the order of the norm.
+      auto oneAttr = rewriter.getFloatAttr(elemType, 1.0);
+      auto oneValue = rewriter.create<arith::ConstantOp>(loc, oneAttr);
+      auto inverseOrdValue =
+          rewriter.create<arith::DivFOp>(loc, oneValue, ordValue);
+      auto expOp = createNormExp(loc, elemType, inverseOrdValue, sumOp, opInfo,
+                                 rewriter);
+      if (!expOp)
+        return failure();
+
+      rewriter.replaceOpWithNewOp<tensor::CastOp>(op, resultType, expOp);
+      return success();
+    }
+
     Value initElem = createLinalgNeutralElementForReduceOp(
         rewriter, loc, op, resultType.getElementType());
 
@@ -355,5 +462,6 @@ void mlir::torch::torch_to_linalg::populateReductionPatternsAndLegality(
   target.addIllegalOp<AtenSumOp>();
   target.addIllegalOp<AtenSumDimIntListOp>();
   target.addIllegalOp<AtenMaxOp>();
+  target.addIllegalOp<AtenLinalgVectorNormOp>();
   patterns.add<ConvertReductionOp>(typeConverter, context);
 }
